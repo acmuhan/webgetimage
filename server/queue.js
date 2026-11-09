@@ -16,6 +16,7 @@ export class ImageQueue extends EventEmitter {
     super();
     this.getSettings = getSettings;
     this.entries = new Map(); // id -> entry
+    this.ipCounts = new Map(); // ip -> 该 IP 当前的记录数（排队中 + 待领取）
     this.waiting = []; // 等待中的 id，按入队顺序
     this.tickets = new Map(); // ticket -> entry id
     this.lastGrantAt = -Infinity;
@@ -38,9 +39,7 @@ export class ImageQueue extends EventEmitter {
   }
 
   countByIp(ip) {
-    let n = 0;
-    for (const e of this.entries.values()) if (e.ip === ip) n++;
-    return n;
+    return this.ipCounts.get(ip) || 0;
   }
 
   join(ip) {
@@ -52,6 +51,7 @@ export class ImageQueue extends EventEmitter {
     const now = Date.now();
     const entry = { id: newId(), ip, status: 'waiting', joinedAt: now, lastSeen: now };
     this.entries.set(entry.id, entry);
+    this.ipCounts.set(ip, this.countByIp(ip) + 1);
     this.waiting.push(entry.id);
     this.positionCache = null;
     this.stats.joined++;
@@ -85,17 +85,28 @@ export class ImageQueue extends EventEmitter {
     };
   }
 
+  /**
+   * 删除一条记录的索引与计数，但不碰 waiting 数组、也不触发调度。
+   * 批量删除时由调用方统一处理 waiting 并只调度一次，避免递归和 O(n²)。
+   */
+  drop(entry, reason) {
+    this.entries.delete(entry.id);
+    if (entry.ticket) this.tickets.delete(entry.ticket);
+    const n = this.countByIp(entry.ip) - 1;
+    if (n > 0) this.ipCounts.set(entry.ip, n);
+    else this.ipCounts.delete(entry.ip);
+    if (reason && reason in this.stats) this.stats[reason]++;
+  }
+
   remove(id, reason) {
     const entry = this.entries.get(id);
     if (!entry) return false;
-    this.entries.delete(id);
+    this.drop(entry, reason);
     if (entry.status === 'waiting') {
-      const i = this.waiting.indexOf(id);
-      if (i !== -1) this.waiting.splice(i, 1);
+      const i = this.position(id);
+      if (i !== undefined) this.waiting.splice(i, 1);
       this.positionCache = null;
     }
-    if (entry.ticket) this.tickets.delete(entry.ticket);
-    if (reason && reason in this.stats) this.stats[reason]++;
     this.pump();
     return true;
   }
@@ -125,7 +136,10 @@ export class ImageQueue extends EventEmitter {
     this.emit('grant', entry);
   }
 
-  /** 尝试放行队首；没到时间就定时到下一个放行点再来 */
+  /**
+   * 尝试放行队首；没到时间就定时到下一个放行点再来。
+   * 纯循环实现，不会与 remove() 互相递归，队首有再多离线者也不会栈溢出。
+   */
   pump() {
     clearTimeout(this.timer);
     this.timer = null;
@@ -133,35 +147,53 @@ export class ImageQueue extends EventEmitter {
 
     const now = Date.now();
     while (this.waiting.length) {
-      const head = this.entries.get(this.waiting[0]);
-      // 已离开的队首直接跳过，不占用名额
-      if (now - head.lastSeen > STALE_MS) {
-        this.remove(head.id, 'abandoned');
-        return; // remove() 内部会再次调用 pump()
+      // 已离开的队首直接跳过，不占用名额；连续的离线者一次性切掉
+      let skip = 0;
+      while (skip < this.waiting.length) {
+        const e = this.entries.get(this.waiting[skip]);
+        if (now - e.lastSeen <= STALE_MS) break;
+        this.drop(e, 'abandoned');
+        skip++;
+      }
+      if (skip) {
+        this.waiting.splice(0, skip);
+        this.positionCache = null;
+        continue;
       }
       const wait = this.nextSlotInMs(now);
       if (wait > 0) {
         this.timer = setTimeout(() => this.pump(), Math.ceil(wait));
         return;
       }
-      this.waiting.shift();
+      const head = this.entries.get(this.waiting.shift());
       this.positionCache = null;
       this.grant(head, now);
     }
   }
 
-  /** 定期清理：离线的排队者、过期未领取的凭证 */
+  /** 定期清理：离线的排队者、过期未领取的凭证。整体 O(n)，最后只调度一次 */
   sweep() {
     const now = Date.now();
-    for (const e of [...this.entries.values()]) {
-      if (e.status === 'granted' && e.expiresAt <= now) this.remove(e.id, 'expired');
-      else if (e.status === 'waiting' && now - e.lastSeen > STALE_MS) this.remove(e.id, 'abandoned');
+    for (const e of this.entries.values()) {
+      if (e.status === 'granted' && e.expiresAt <= now) this.drop(e, 'expired');
     }
+    const before = this.waiting.length;
+    this.waiting = this.waiting.filter((id) => {
+      const e = this.entries.get(id);
+      if (now - e.lastSeen <= STALE_MS) return true;
+      this.drop(e, 'abandoned');
+      return false;
+    });
+    if (this.waiting.length !== before) this.positionCache = null;
+    this.pump();
   }
 
   clearWaiting() {
     const n = this.waiting.length;
-    for (const id of [...this.waiting]) this.remove(id, 'kicked');
+    for (const id of this.waiting) this.drop(this.entries.get(id), 'kicked');
+    this.waiting = [];
+    this.positionCache = null;
+    this.pump();
     return n;
   }
 

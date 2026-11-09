@@ -20,12 +20,38 @@ cp .env.example .env      # 修改 ADMIN_PASSWORD
 docker compose up -d --build
 ```
 
-- 访客页：`http://<主机>:3000/`
-- 控制台：`http://<主机>:3000/admin`
+- 访客页：`/`
+- 控制台：`/admin`
 
 设置和图片保存在具名卷 `image-queue-data`（容器内 `/data`）。队列和 Cap 令牌只存在内存里，重启后排队中的访客需要重新排队。
 
-放在 Nginx、Caddy 等反向代理后面时，在 `.env` 里设置 `TRUST_PROXY=1`，否则所有访客的 IP 都是代理的 IP，每 IP 限制会误伤。直接对外暴露时保持为空。
+### 网络与真实 IP
+
+每 IP 排队上限、接口限速和登录锁定都依赖访客的真实 IP，`BIND_ADDR` 和 `TRUST_PROXY` 必须配对设置：
+
+| 部署方式 | `BIND_ADDR` | `TRUST_PROXY` |
+|---|---|---|
+| 反向代理后面（默认，推荐） | `127.0.0.1` | `1` |
+| 直接对外，不用代理 | `0.0.0.0` | 留空 |
+
+- 只设 `TRUST_PROXY=1` 却把端口对外开放：任何人都能伪造 `X-Forwarded-For`，绕过所有按 IP 的限制。
+- 在代理后面却不设 `TRUST_PROXY`：所有访客都是同一个 IP，全站同时只能排 `maxPerIp` 个人，有人输错几次密码就会把管理员锁在外面。
+- 代理需要转发 `X-Forwarded-For`，例如 Nginx 的 `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`。Caddy 的 `reverse_proxy` 默认就会转发。
+
+### 限速
+
+接口按 IP 限速，超出返回 429 并带 `Retry-After`。数值按同一出口 IP 后面有几十个真实用户（公司、校园网 NAT）留了余量：
+
+| 接口 | 每 IP 每分钟 |
+|---|---|
+| `/cap/challenge`、`/cap/redeem` | 30 |
+| `POST /api/queue`（入队） | 20 |
+| `GET /api/queue/:id`（轮询，单人约 40 次/分钟） | 1200 |
+| `GET /api/image/:ticket` | 60 |
+| `POST /api/admin/login` | 10 |
+| 其他公共接口 | 300 |
+
+另外，待解的 Cap 挑战和未使用的令牌各自最多保存 5 万个，满了以后新请求返回 503，防止被刷爆内存。需要调整时修改 `server/index.js` 里的 `limits` 和 `server/cap.js` 顶部的常量。
 
 ## 环境变量
 
@@ -34,8 +60,9 @@ docker compose up -d --build
 | `ADMIN_PASSWORD` | 无，必填 | 控制台密码，至少 8 位 |
 | `PORT` | `3000` | 容器内监听端口 |
 | `HOST_PORT` | `3000` | compose 映射到宿主机的端口 |
+| `BIND_ADDR` | `127.0.0.1` | compose 绑定的宿主机地址，见上文 |
 | `DATA_DIR` | `/data` | 数据目录 |
-| `TRUST_PROXY` | 空 | 反向代理层数或 Express `trust proxy` 取值 |
+| `TRUST_PROXY` | 空（`.env.example` 里为 `1`） | 反向代理层数或 Express `trust proxy` 取值 |
 | `MAX_UPLOAD_MB` | `20` | 上传图片大小上限 |
 
 ## 本地开发

@@ -7,6 +7,7 @@ import { createStore, validateSettings } from './store.js';
 import { ImageQueue } from './queue.js';
 import { createCap } from './cap.js';
 import { createAuth } from './auth.js';
+import { rateLimit } from './ratelimit.js';
 
 const PORT = Number(process.env.PORT || 3000);
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
@@ -39,6 +40,19 @@ app.use((req, res, next) => {
 });
 app.use(express.json({ limit: '64kb' }));
 
+// 按 IP 限速。数值按「同一出口 IP 后面可能有几十个真实用户（公司、校园网 NAT）」留了余量：
+// 访客页每 1.5 秒轮询一次，单人约 40 次/分钟。
+const MINUTE = 60_000;
+const limits = {
+  challenge: rateLimit({ windowMs: MINUTE, max: 30 }),
+  redeem: rateLimit({ windowMs: MINUTE, max: 30 }),
+  join: rateLimit({ windowMs: MINUTE, max: 20 }),
+  poll: rateLimit({ windowMs: MINUTE, max: 1200 }),
+  image: rateLimit({ windowMs: MINUTE, max: 60 }),
+  login: rateLimit({ windowMs: MINUTE, max: 10, message: '登录尝试过于频繁，请稍后再试' }),
+  general: rateLimit({ windowMs: MINUTE, max: 300 }),
+};
+
 const api = express.Router();
 api.use((req, res, next) => {
   res.set('Cache-Control', 'no-store');
@@ -46,7 +60,7 @@ api.use((req, res, next) => {
 });
 
 // ---------- 公共信息 ----------
-api.get('/public', (req, res) => {
+api.get('/public', limits.general, (req, res) => {
   const s = store.settings;
   res.json({
     title: s.title,
@@ -60,17 +74,20 @@ api.get('/public', (req, res) => {
 });
 
 // ---------- Cap 人机验证（组件的 data-cap-api-endpoint 指向 /cap/） ----------
-app.post('/cap/challenge', async (req, res) => {
-  res.set('Cache-Control', 'no-store').json(await cap.createChallenge(store.settings.capDifficulty));
+app.post('/cap/challenge', limits.challenge, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const ch = await cap.createChallenge(store.settings.capDifficulty);
+  if (!ch) return res.status(503).json({ error: '服务繁忙，请稍后再试' });
+  res.json(ch);
 });
-app.post('/cap/redeem', async (req, res) => {
+app.post('/cap/redeem', limits.redeem, async (req, res) => {
   const { token, solutions } = req.body || {};
   if (!token || !solutions) return res.status(400).json({ success: false });
   res.set('Cache-Control', 'no-store').json(await cap.redeem(token, solutions));
 });
 
 // ---------- 排队 ----------
-api.post('/queue', async (req, res) => {
+api.post('/queue', limits.join, async (req, res) => {
   if (!store.image) return res.status(503).json({ error: '暂未上传图片', code: 'no_image' });
   const capToken = req.body?.capToken;
   if (!(await cap.validate(capToken))) return res.status(403).json({ error: '人机验证无效或已过期，请重新验证', code: 'captcha' });
@@ -79,15 +96,15 @@ api.post('/queue', async (req, res) => {
   res.status(201).json({ id: r.entry.id, ...queue.status(r.entry.id) });
 });
 
-api.get('/queue/:id', (req, res) => res.json(queue.status(req.params.id)));
+api.get('/queue/:id', limits.poll, (req, res) => res.json(queue.status(req.params.id)));
 
-api.delete('/queue/:id', (req, res) => {
+api.delete('/queue/:id', limits.general, (req, res) => {
   queue.remove(req.params.id, 'abandoned');
   res.status(204).end();
 });
 
 // 凭证换图片：一次性，过期作废
-api.get('/image/:ticket', (req, res) => {
+api.get('/image/:ticket', limits.image, (req, res) => {
   const file = store.imagePath();
   if (!file || !fs.existsSync(file)) return res.status(404).json({ error: '图片不存在' });
   if (!queue.consumeTicket(req.params.ticket)) return res.status(403).json({ error: '凭证无效、已使用或已过期' });
@@ -96,7 +113,7 @@ api.get('/image/:ticket', (req, res) => {
 });
 
 // ---------- 控制台 ----------
-api.post('/admin/login', (req, res) => {
+api.post('/admin/login', limits.login, (req, res) => {
   const r = auth.login(req.ip, req.body?.password);
   if (r.error) return res.status(r.status).json({ error: r.error });
   res.json(r);

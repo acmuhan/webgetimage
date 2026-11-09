@@ -77,6 +77,72 @@ test('长时间不轮询的排队者被移出，不占用名额', (t) => {
   q.close();
 });
 
+test('队首大量离线者不会栈溢出，清理为线性时间', (t) => {
+  // 修复前：pump() 与 remove() 互相递归，约 4000 个连续离线者就会栈溢出并让进程退出
+  const { q, grants } = setup(t, { windowSec: 3600, quota: 1, maxQueue: 1e6, maxPerIp: 1e6 });
+  q.join('first'); // 立即放行，之后 1 小时内不会再放行
+  const n = 50_000;
+  for (let i = 0; i < n; i++) q.join(`ip${i % 100}`);
+  const alive = q.join('alive').entry.id;
+
+  for (let i = 0; i < 20; i++) {
+    t.mock.timers.tick(1000);
+    q.status(alive); // 只有最后一人保持在线
+  }
+  assert.equal(q.waiting.length, 1, '离线者全部被清理');
+  assert.equal(q.status(alive).position, 1);
+  assert.equal(q.stats.abandoned, n);
+  assert.equal(q.ipCounts.size, 2, '每 IP 计数随清理一起释放（剩 first 与 alive）');
+  assert.equal(grants.length, 1);
+
+  // 到下一个放行点时，alive 前面没有残留的离线者，直接被放行
+  for (let i = 20; i < 3600; i++) {
+    t.mock.timers.tick(1000);
+    q.status(alive);
+  }
+  assert.equal(grants.length, 2);
+  assert.equal(grants[1].id, alive);
+  q.close();
+});
+
+test('放行时一次跳过连续多个离线的队首', (t) => {
+  const { q, grants } = setup(t, { windowSec: 10, quota: 1, maxQueue: 1e6, maxPerIp: 1e6 }); // 每 10 秒 1 人
+  q.join('first');
+  for (let i = 0; i < 10_000; i++) q.join('gone');
+  const alive = q.join('alive').entry.id;
+  // 关掉定时清理，只测 pump() 自己跳过离线队首的逻辑
+  clearInterval(q.sweeper);
+  for (let i = 0; i < 25; i++) {
+    t.mock.timers.tick(1000);
+    q.status(alive); // 只有 alive 在轮询
+  }
+  // 第 10 秒：离线者才离开 10 秒（未超过 15 秒），放行第一个 gone
+  // 第 20 秒：其余 9999 个 gone 都已超时，被一次性跳过，放行 alive
+  assert.equal(grants.length, 3);
+  assert.equal(grants[2].id, alive);
+  assert.equal(grants[2].at - grants[1].at, 10_000);
+  assert.equal(q.stats.abandoned, 9_999);
+  q.close();
+});
+
+test('每 IP 计数：领取、过期、移出后都会释放名额', (t) => {
+  const { q } = setup(t, { maxPerIp: 2, ticketTtlSec: 5 });
+  const a = q.join('x').entry.id; // 立即放行
+  q.join('x');
+  assert.equal(q.join('x').code, 'ip_limit');
+
+  assert.equal(q.consumeTicket(q.status(a).ticket), true); // 领取后释放 1 个
+  const c = q.join('x').entry.id;
+  assert.equal(q.join('x').code, 'ip_limit');
+
+  q.remove(c, 'kicked');
+  assert.equal(q.countByIp('x'), 1);
+  q.clearWaiting();
+  assert.equal(q.countByIp('x'), 0);
+  assert.equal(q.ipCounts.has('x'), false, '计数归零后删除键，不留垃圾');
+  q.close();
+});
+
 test('暂停、队列上限、每 IP 上限', (t) => {
   const { q, settings } = setup(t, { maxQueue: 2, maxPerIp: 2 });
   q.join('x'); // 立即放行，不计入等待队列

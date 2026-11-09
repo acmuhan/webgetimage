@@ -5,7 +5,11 @@ services:
     container_name: image-queue
     restart: unless-stopped
     ports:
-      - "${HOST_PORT:-3000}:3000"
+      # 监听地址由 BIND_ADDR 决定：
+      # - 放在 Nginx/Caddy 后面时用默认的 127.0.0.1，只让本机代理访问，
+      #   并设置 TRUST_PROXY=1；否则外部可以直连并伪造 X-Forwarded-For。
+      # - 不用反向代理、直接对外时设 BIND_ADDR=0.0.0.0，且 TRUST_PROXY 必须留空。
+      - "${BIND_ADDR:-127.0.0.1}:${HOST_PORT:-3000}:3000"
     environment:
       # 必填：未设置时 compose 会直接报错并给出下面这句话，而不是启动后才失败
       ADMIN_PASSWORD: "${ADMIN_PASSWORD:?请在 .env 中设置 ADMIN_PASSWORD（至少 8 位）}"

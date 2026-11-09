@@ -27,8 +27,9 @@ export function validateSettings(input) {
   if (!input || typeof input !== 'object') return { error: '请求体必须是对象' };
   const out = {};
   for (const [key, raw] of Object.entries(input)) {
+    // 只认自有属性：避免 constructor、toString 等原型链上的键被当成合法字段
+    if (!Object.hasOwn(SETTING_RULES, key)) return { error: `未知字段：${key}` };
     const rule = SETTING_RULES[key];
-    if (!rule) return { error: `未知字段：${key}` };
     if (rule.bool) {
       if (typeof raw !== 'boolean') return { error: `${key} 必须是布尔值` };
       out[key] = raw;
