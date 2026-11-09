@@ -1,0 +1,27 @@
+services:
+  image-queue:
+    build: .
+    image: image-queue:latest
+    container_name: image-queue
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-3000}:3000"
+    environment:
+      # 必填：未设置时 compose 会直接报错并给出下面这句话，而不是启动后才失败
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:?请在 .env 中设置 ADMIN_PASSWORD（至少 8 位）}"
+      TRUST_PROXY: "${TRUST_PROXY:-}"
+      MAX_UPLOAD_MB: "${MAX_UPLOAD_MB:-20}"
+    volumes:
+      # 用具名卷而不是 ./data 绑定挂载：容器以 node(uid 1000) 运行，
+      # 具名卷会继承镜像内 /data 的属主，开箱即可写；绑定挂载到宿主机目录
+      # 则往往是 root 所有，容器内写不进（表现为上传图片/改设置报 500）。
+      - image-queue-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/public"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  image-queue-data:
